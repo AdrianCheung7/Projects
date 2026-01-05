@@ -1,0 +1,1121 @@
+"""Freeze UI utility leveraging the puzzle game's right-click minimize bug.
+
+This module exposes a Tkinter interface paired with global hotkeys: F2 handles
+the freeze toggle and F3 starts/stops the programmable macro runner. Pick the
+game window from a live list, tap F2 to engage the freeze (the cursor jumps to
+the minimize button, performs a right-button hold, and snaps back), then tap F2
+again to release the hold anywhere on screen. Build macro loops that blend key
+presses, delays, and freeze actions, triggering them manually or by pressing F3.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import threading
+import time
+from abc import ABC, abstractmethod
+from ctypes import wintypes
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except ImportError as exc:  # pragma: no cover - Tkinter is part of stdlib on Windows
+    raise SystemExit(
+        "Tkinter is required for the Freeze UI prototype. "
+        "Install it via the Python installer or enable the tcl/tk option."
+    ) from exc
+
+USER32 = ctypes.windll.user32
+
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+
+SM_CXSIZE = 30
+SM_CYSIZE = 31
+
+WM_HOTKEY = 0x0312
+VK_F2 = 0x71
+VK_F3 = 0x72
+VK_RBUTTON = 0x02
+PM_REMOVE = 0x0001
+FREEZE_HOTKEY_ID = 1
+MACRO_HOTKEY_ID = 2
+CURSOR_SETTLE_DELAY = 0.01
+KEYEVENTF_KEYUP = 0x0002
+
+VK_NAME_MAP = {
+    "F1": 0x70,
+    "F2": 0x71,
+    "F3": 0x72,
+    "F4": 0x73,
+    "F5": 0x74,
+    "F6": 0x75,
+    "F7": 0x76,
+    "F8": 0x77,
+    "F9": 0x78,
+    "F10": 0x79,
+    "F11": 0x7A,
+    "F12": 0x7B,
+    "SPACE": 0x20,
+    "ENTER": 0x0D,
+    "TAB": 0x09,
+    "ESC": 0x1B,
+    "ESCAPE": 0x1B,
+    "LEFT": 0x25,
+    "UP": 0x26,
+    "RIGHT": 0x27,
+    "DOWN": 0x28,
+}
+
+
+MOUSE_BUTTON_EVENTS = {
+    "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+    "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+}
+
+
+@dataclass
+class Point:
+    x: int
+    y: int
+
+
+def _get_system_metric(metric: int) -> int:
+    return USER32.GetSystemMetrics(metric)
+
+
+def _get_cursor_pos() -> Point:
+    point = wintypes.POINT()
+    USER32.GetCursorPos(ctypes.byref(point))
+    return Point(point.x, point.y)
+
+
+def _set_cursor_pos(point: Point) -> None:
+    USER32.SetCursorPos(point.x, point.y)
+
+
+def _send_mouse_event(flag: int) -> None:
+    USER32.mouse_event(flag, 0, 0, 0, 0)
+
+
+def _sleep_tick(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _is_key_down(vk_code: int) -> bool:
+    return bool(USER32.GetAsyncKeyState(vk_code) & 0x8000)
+
+
+def _ensure_right_button_released() -> None:
+    if _is_key_down(VK_RBUTTON):
+        _send_mouse_event(MOUSEEVENTF_RIGHTUP)
+        _sleep_tick(CURSOR_SETTLE_DELAY / 2)
+
+
+def _get_vk_code(key_name: str) -> Optional[int]:
+    name = key_name.strip().upper()
+    if not name:
+        return None
+    if name in VK_NAME_MAP:
+        return VK_NAME_MAP[name]
+    if len(name) == 1:
+        char = name
+        if "A" <= char <= "Z" or "0" <= char <= "9":
+            return ord(char)
+    return None
+
+
+def _send_key_event(vk_code: int, key_up: bool) -> None:
+    scan_code = USER32.MapVirtualKeyW(vk_code, 0)
+    flags = KEYEVENTF_KEYUP if key_up else 0
+    USER32.keybd_event(vk_code, scan_code, flags, 0)
+
+
+def _enum_windows() -> List[int]:
+    handles: List[int] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def _callback(hwnd: int, _: int) -> bool:
+        handles.append(hwnd)
+        return True
+
+    USER32.EnumWindows(_callback, 0)
+    return handles
+
+
+def _is_window_visible(hwnd: int) -> bool:
+    return bool(USER32.IsWindowVisible(hwnd))
+
+
+def _get_window_text(hwnd: int) -> str:
+    length = USER32.GetWindowTextLengthW(hwnd)
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    USER32.GetWindowTextW(hwnd, buffer, length + 1)
+    return buffer.value
+
+
+def _get_window_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
+    rect = wintypes.RECT()
+    if USER32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return rect.left, rect.top, rect.right, rect.bottom
+    return None
+
+
+def _set_foreground(hwnd: int) -> None:
+    USER32.SetForegroundWindow(hwnd)
+
+
+def _list_visible_windows() -> List[Tuple[int, str]]:
+    windows: List[Tuple[int, str]] = []
+    for hwnd in _enum_windows():
+        if not _is_window_visible(hwnd):
+            continue
+        title = _get_window_text(hwnd).strip()
+        if title:
+            windows.append((hwnd, title))
+    windows.sort(key=lambda item: item[1].lower())
+    return windows
+
+
+class FreezeController:
+    """Finds the target window and simulates the freeze/unfreeze action."""
+
+    def __init__(self) -> None:
+        self._target_hwnd: Optional[int] = None
+        self._freeze_active = threading.Event()
+        self._lock = threading.Lock()
+        self._state_callback: Optional[Callable[[str], None]] = None
+        self._pending_thread: Optional[threading.Thread] = None
+        self._pending_cancel = threading.Event()
+
+    def available_windows(self) -> List[Tuple[int, str]]:
+        return _list_visible_windows()
+
+    def set_target_window(self, hwnd: int) -> bool:
+        if hwnd and USER32.IsWindow(hwnd):
+            self._target_hwnd = hwnd
+            return True
+        return False
+
+    def set_state_callback(self, callback: Optional[Callable[[str], None]]) -> None:
+        self._state_callback = callback
+
+    def _notify_state(self, state: str) -> None:
+        callback = self._state_callback
+        if callback:
+            try:
+                callback(state)
+            except Exception:
+                pass
+
+    def _schedule_pending_freeze(self) -> None:
+        if self._pending_thread and self._pending_thread.is_alive():
+            return
+
+        self._pending_cancel.clear()
+
+        def _worker() -> None:
+            try:
+                while _is_key_down(VK_RBUTTON):
+                    if self._pending_cancel.is_set():
+                        self._notify_state("cancelled")
+                        return
+                    _sleep_tick(0.01)
+                if self._pending_cancel.is_set():
+                    self._notify_state("cancelled")
+                    return
+                _sleep_tick(0.02)
+                self._perform_engage()
+            except Exception as exc:  # pragma: no cover - best effort feedback
+                self._notify_state(f"error:{exc}")
+            finally:
+                with self._lock:
+                    self._pending_thread = None
+                    self._pending_cancel.clear()
+
+        self._pending_thread = threading.Thread(target=_worker, daemon=True)
+        self._pending_thread.start()
+        self._notify_state("pending")
+
+    def cancel_pending(self) -> None:
+        thread: Optional[threading.Thread] = None
+        with self._lock:
+            if self._pending_thread and self._pending_thread.is_alive():
+                self._pending_cancel.set()
+                thread = self._pending_thread
+        if thread:
+            thread.join(timeout=0.5)
+
+    def engage_freeze(self) -> str:
+        """Attempt to activate the freeze; may defer until right button is free."""
+        with self._lock:
+            if self._freeze_active.is_set():
+                return "engaged"
+            if self._pending_thread and self._pending_thread.is_alive():
+                return "pending"
+            if _is_key_down(VK_RBUTTON):
+                self._schedule_pending_freeze()
+                return "pending"
+        self._perform_engage()
+        return "engaged"
+
+    def force_engage_freeze(self) -> None:
+        """Immediately engage freeze, cancelling any pending waits."""
+        self.cancel_pending()
+        self._perform_engage()
+
+    def _perform_engage(self) -> None:
+        """Activate the freeze effect by simulating a right-button hold."""
+        with self._lock:
+            if self._freeze_active.is_set():
+                return
+            hwnd = self._target_hwnd
+            if not hwnd:
+                raise RuntimeError("No target window selected.")
+
+            rect = _get_window_rect(hwnd)
+            if rect is None:
+                raise RuntimeError("Cannot read target window bounds.")
+
+            _ensure_right_button_released()
+            _set_foreground(hwnd)
+            _sleep_tick(CURSOR_SETTLE_DELAY)
+
+            _, top, right, _ = rect
+            caption_width = _get_system_metric(SM_CXSIZE)
+            caption_height = _get_system_metric(SM_CYSIZE)
+
+            minimize_x = right - (caption_width * 3) + caption_width // 2
+            minimize_y = top + caption_height // 2
+
+            original_cursor = _get_cursor_pos()
+            _set_cursor_pos(Point(minimize_x, minimize_y))
+            _sleep_tick(CURSOR_SETTLE_DELAY)
+            _send_mouse_event(MOUSEEVENTF_RIGHTDOWN)
+            _sleep_tick(CURSOR_SETTLE_DELAY / 2)
+            _set_cursor_pos(original_cursor)
+            self._freeze_active.set()
+        self._notify_state("engaged")
+
+    def release_freeze(self) -> None:
+        """Release the freeze effect by issuing a right-button up event."""
+        with self._lock:
+            if not self._freeze_active.is_set():
+                return
+            _send_mouse_event(MOUSEEVENTF_RIGHTUP)
+            self._freeze_active.clear()
+        self._notify_state("released")
+
+    def toggle_freeze(self) -> str:
+        if self.is_frozen():
+            self.release_freeze()
+            return "released"
+        with self._lock:
+            if self._pending_thread and self._pending_thread.is_alive():
+                self._pending_cancel.set()
+                return "cancelled"
+        return self.engage_freeze()
+
+    def is_frozen(self) -> bool:
+        return self._freeze_active.is_set()
+
+
+class GlobalHotkeyListener:
+    """Background listener that invokes a callback whenever the hotkey fires."""
+
+    def __init__(self, vk_code: int, callback: Callable[[], None], hotkey_id: int) -> None:
+        self.vk_code = vk_code
+        self.callback = callback
+        self.hotkey_id = hotkey_id
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._failed_event = threading.Event()
+
+    def start(self, timeout: float = 1.0) -> bool:
+        if self._thread and self._thread.is_alive():
+            return True
+        self._stop_event.clear()
+        self._ready_event.clear()
+        self._failed_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._ready_event.wait(timeout=timeout)
+        return not self._failed_event.is_set()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+
+    def _run(self) -> None:
+        registered = USER32.RegisterHotKey(None, self.hotkey_id, 0, self.vk_code)
+        if not registered:
+            self._failed_event.set()
+            self._ready_event.set()
+            return
+        self._ready_event.set()
+
+        msg = wintypes.MSG()
+        try:
+            while not self._stop_event.is_set():
+                if USER32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                    if msg.message == WM_HOTKEY and msg.wParam == self.hotkey_id:
+                        self.callback()
+                else:
+                    _sleep_tick(0.01)
+        finally:
+            if registered:
+                USER32.UnregisterHotKey(None, self.hotkey_id)
+
+
+class MacroAction(ABC):
+    """Base class for macro actions."""
+
+    @abstractmethod
+    def execute(self, controller: FreezeController, stop_event: threading.Event) -> None:
+        ...
+
+    @abstractmethod
+    def describe(self) -> str:
+        ...
+
+
+@dataclass
+class DelayAction(MacroAction):
+    seconds: float
+
+    def execute(self, controller: FreezeController, stop_event: threading.Event) -> None:  # noqa: ARG002
+        remaining = max(0.0, self.seconds)
+        deadline = time.perf_counter() + remaining
+        while remaining > 0 and not stop_event.is_set():
+            sleep_amount = min(0.05, remaining)
+            time.sleep(sleep_amount)
+            remaining = deadline - time.perf_counter()
+
+    def describe(self) -> str:
+        return f"Delay {self.seconds:.3f}s"
+
+
+@dataclass
+class KeyPressAction(MacroAction):
+    key: str
+    hold_seconds: float = 0.05
+
+    def execute(self, controller: FreezeController, stop_event: threading.Event) -> None:  # noqa: ARG002
+        vk_code = _get_vk_code(self.key)
+        if vk_code is None:
+            raise ValueError(f"Unsupported key: {self.key!r}")
+        _send_key_event(vk_code, False)
+        hold = max(0.0, self.hold_seconds)
+        if hold > 0:
+            deadline = time.perf_counter() + hold
+            while time.perf_counter() < deadline and not stop_event.is_set():
+                time.sleep(min(0.01, deadline - time.perf_counter()))
+        _send_key_event(vk_code, True)
+
+    def describe(self) -> str:
+        label = self.key.upper()
+        hold = max(0.0, self.hold_seconds)
+        if hold:
+            return f"Press {label} (hold {hold:.3f}s)"
+        return f"Press {label}"
+
+
+@dataclass
+class MouseClickAction(MacroAction):
+    button: str
+    hold_seconds: float = 0.05
+
+    def execute(self, controller: FreezeController, stop_event: threading.Event) -> None:  # noqa: ARG002
+        button_key = self.button.strip().lower()
+        events = MOUSE_BUTTON_EVENTS.get(button_key)
+        if events is None:
+            raise ValueError(f"Unsupported mouse button: {self.button!r}")
+        down_event, up_event = events
+        _send_mouse_event(down_event)
+        hold = max(0.0, self.hold_seconds)
+        if hold > 0:
+            deadline = time.perf_counter() + hold
+            while time.perf_counter() < deadline and not stop_event.is_set():
+                time.sleep(min(0.01, deadline - time.perf_counter()))
+        _send_mouse_event(up_event)
+
+    def describe(self) -> str:
+        label = self.button.strip().lower()
+        label = label.capitalize() if label else "Mouse"
+        hold = max(0.0, self.hold_seconds)
+        if hold:
+            return f"Click {label} (hold {hold:.3f}s)"
+        return f"Click {label}"
+
+
+@dataclass
+class FreezeAction(MacroAction):
+    mode: str  # engage, release, toggle
+
+    def execute(self, controller: FreezeController, stop_event: threading.Event) -> None:
+        mode = self.mode
+        if mode == "engage":
+            controller.force_engage_freeze()
+        elif mode == "release":
+            controller.release_freeze()
+        else:
+            result = controller.toggle_freeze()
+            if result == "pending":
+                # Wait briefly for the freeze to engage before continuing.
+                deadline = time.perf_counter() + 1.0
+                while time.perf_counter() < deadline and not stop_event.is_set():
+                    if controller.is_frozen():
+                        break
+                    time.sleep(0.01)
+
+    def describe(self) -> str:
+        if self.mode == "engage":
+            return "Freeze Engage"
+        if self.mode == "release":
+            return "Freeze Release"
+        return "Freeze Toggle"
+
+
+class MacroRunner:
+    """Executes a macro plan with optional repetition."""
+
+    def __init__(
+        self,
+        controller: FreezeController,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.controller = controller
+        self.status_callback = status_callback
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def _notify(self, state: str) -> None:
+        if self.status_callback:
+            try:
+                self.status_callback(state)
+            except Exception:
+                pass
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, steps: List[MacroAction], mode: str) -> Tuple[bool, Optional[str]]:
+        if not steps:
+            return False, "Add at least one macro step."
+        with self._lock:
+            if self.is_running():
+                return False, "Macro already running."
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(list(steps), mode),
+                daemon=True,
+            )
+            self._thread.start()
+        self._notify("running")
+        return True, None
+
+    def stop(self) -> None:
+        with self._lock:
+            thread = self._thread if self.is_running() else None
+            if thread is None:
+                return
+            self._stop_event.set()
+        thread.join(timeout=1.0)
+
+    def _run(self, steps: List[MacroAction], mode: str) -> None:
+        try:
+            repeat = mode == "repeat"
+            while True:
+                for action in steps:
+                    if self._stop_event.is_set():
+                        self._notify("stopped")
+                        return
+                    action.execute(self.controller, self._stop_event)
+                if not repeat or self._stop_event.is_set():
+                    break
+            if self._stop_event.is_set():
+                self._notify("stopped")
+            else:
+                self._notify("completed")
+        except Exception as exc:  # pragma: no cover - guard rail
+            self._notify(f"error:{exc}")
+        finally:
+            with self._lock:
+                self._thread = None
+                self._stop_event.clear()
+
+
+class FreezeStatusBar(tk.Toplevel):
+    """Topmost indicator window that reflects the freeze state."""
+
+    def __init__(self, master: tk.Misc) -> None:
+        super().__init__(master)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", 0.9)
+
+        self._message_var = tk.StringVar(value="Freeze idle (F2)")
+        self._current_state: Optional[bool] = None
+
+        self.configure(bg="#303030")
+        label = tk.Label(
+            self,
+            textvariable=self._message_var,
+            bg="#303030",
+            fg="#f5f5f5",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=4,
+        )
+        label.pack()
+
+        self._recenter()
+        self.deiconify()
+
+    def _recenter(self) -> None:
+        self.update_idletasks()
+        screen_w = self.winfo_screenwidth()
+        width = self.winfo_width()
+        x = (screen_w - width) // 2
+        self.geometry(f"+{x}+10")
+
+    def update_state(self, frozen: bool) -> None:
+        color = "#1f7a1f" if frozen else "#303030"
+        text = "Freeze ACTIVE (F2)" if frozen else "Freeze idle (F2)"
+        self._message_var.set(text)
+        self.configure(bg=color)
+        for child in self.winfo_children():
+            child.configure(bg=color)
+        self._current_state = frozen
+        self._recenter()
+
+    def show_pending(self, message: str) -> None:
+        color = "#7a5c1f"
+        self._message_var.set(message)
+        self.configure(bg=color)
+        for child in self.winfo_children():
+            child.configure(bg=color)
+        self._current_state = None
+        self._recenter()
+
+    def show_warning(self, message: str) -> None:
+        color = "#8a1c1c"
+        self._message_var.set(message)
+        self.configure(bg=color)
+        for child in self.winfo_children():
+            child.configure(bg=color)
+        self._recenter()
+
+
+class FreezeUI(tk.Tk):
+    """Simple Tk UI for engaging and releasing the freeze mechanic."""
+
+    def __init__(self, controller: FreezeController) -> None:
+        super().__init__()
+        self.controller = controller
+        self.title("Freeze UI")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.columnconfigure(0, weight=1)
+
+        self.status_var = tk.StringVar(value="Press Refresh to list windows.")
+        self.freeze_button: Optional[ttk.Button] = None
+        self.window_combo: Optional[ttk.Combobox] = None
+        self.window_map: Dict[str, int] = {}
+        self.macro_steps: List[MacroAction] = []
+        self.macro_mode = tk.StringVar(value="on_press")
+        self.macro_action_var = tk.StringVar(value="Delay")
+        self.macro_status_var = tk.StringVar(value="Macro idle.")
+        self.macro_runner = MacroRunner(controller, self._macro_status_callback)
+
+        self._build_widgets()
+
+        self.status_bar = FreezeStatusBar(self)
+        self.status_bar.update_state(False)
+
+        self.controller.set_state_callback(self._controller_state_callback)
+
+        self.freeze_hotkey_listener = GlobalHotkeyListener(
+            VK_F2,
+            self._handle_freeze_hotkey,
+            FREEZE_HOTKEY_ID,
+        )
+        if not self.freeze_hotkey_listener.start():
+            self.status_var.set("F2 hotkey unavailable. Use the button toggle.")
+            self.status_bar.show_warning("F2 hotkey unavailable")
+        self.macro_hotkey_listener = GlobalHotkeyListener(
+            VK_F3,
+            self._handle_macro_hotkey,
+            MACRO_HOTKEY_ID,
+        )
+        if not self.macro_hotkey_listener.start():
+            self._set_macro_status("F3 hotkey unavailable. Use Run button.", style="error")
+
+    def _build_widgets(self) -> None:
+        padding = {"padx": 12, "pady": 6}
+
+        ttk.Label(
+            self,
+            text="Select target window:",
+        ).grid(row=0, column=0, sticky="w", **padding)
+
+        self.window_combo = ttk.Combobox(self, state="readonly", width=40)
+        self.window_combo.grid(row=1, column=0, sticky="ew", **padding)
+
+        controls = ttk.Frame(self)
+        controls.grid(row=2, column=0, sticky="ew", **padding)
+        controls.columnconfigure(0, weight=1)
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Button(
+            controls,
+            text="Refresh",
+            command=self._refresh_windows,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        ttk.Button(
+            controls,
+            text="Lock to Window",
+            command=self._on_lock_window,
+        ).grid(row=0, column=1, sticky="ew")
+
+        self.freeze_button = ttk.Button(
+            self,
+            text="Engage Freeze",
+            command=self._on_toggle_freeze,
+            state=tk.DISABLED,
+        )
+        self.freeze_button.grid(row=3, column=0, sticky="ew", **padding)
+
+        ttk.Label(
+            self,
+            textvariable=self.status_var,
+            foreground="#2d89ef",
+        ).grid(row=4, column=0, sticky="w", padx=12, pady=(6, 12))
+
+        ttk.Separator(self).grid(row=5, column=0, sticky="ew", padx=12)
+
+        macro_frame = ttk.LabelFrame(self, text="Macro Planner")
+        macro_frame.grid(row=6, column=0, sticky="nsew", padx=12, pady=(8, 12))
+        macro_frame.columnconfigure(0, weight=1)
+
+        mode_frame = ttk.Frame(macro_frame)
+        mode_frame.grid(row=0, column=0, sticky="w", pady=(6, 3))
+        ttk.Label(mode_frame, text="Mode:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Radiobutton(
+            mode_frame,
+            text="On Press",
+            value="on_press",
+            variable=self.macro_mode,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Repeat Until Stop",
+            value="repeat",
+            variable=self.macro_mode,
+        ).grid(row=0, column=2, sticky="w")
+
+        steps_frame = ttk.Frame(macro_frame)
+        steps_frame.grid(row=1, column=0, sticky="nsew", pady=3)
+        steps_frame.columnconfigure(0, weight=1)
+        steps_frame.rowconfigure(0, weight=1)
+
+        self.macro_listbox = tk.Listbox(steps_frame, height=8, activestyle="dotbox")
+        self.macro_listbox.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(steps_frame, orient=tk.VERTICAL, command=self.macro_listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.macro_listbox.configure(yscrollcommand=scrollbar.set)
+
+        step_controls = ttk.Frame(steps_frame)
+        step_controls.grid(row=0, column=2, sticky="nsw", padx=(8, 0))
+
+        ttk.Button(step_controls, text="Move Up", command=lambda: self._on_move_macro_step(-1)).grid(
+            row=0, column=0, sticky="ew", pady=2
+        )
+        ttk.Button(step_controls, text="Move Down", command=lambda: self._on_move_macro_step(1)).grid(
+            row=1, column=0, sticky="ew", pady=2
+        )
+        ttk.Button(step_controls, text="Remove", command=self._on_remove_macro_step).grid(
+            row=2, column=0, sticky="ew", pady=2
+        )
+        ttk.Button(step_controls, text="Clear", command=self._on_clear_macro_steps).grid(
+            row=3, column=0, sticky="ew", pady=2
+        )
+
+        builder_frame = ttk.LabelFrame(macro_frame, text="Add Step")
+        builder_frame.grid(row=2, column=0, sticky="ew", pady=6)
+        builder_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(builder_frame, text="Action Type:").grid(row=0, column=0, sticky="w", padx=(6, 8), pady=6)
+        action_options = [
+            "Delay",
+            "Send Key",
+            "Mouse Click",
+            "Freeze Engage",
+            "Freeze Release",
+            "Freeze Toggle",
+        ]
+        action_menu = ttk.Combobox(
+            builder_frame,
+            state="readonly",
+            values=action_options,
+            textvariable=self.macro_action_var,
+            width=18,
+        )
+        action_menu.grid(row=0, column=1, sticky="w", pady=6)
+        action_menu.bind("<<ComboboxSelected>>", lambda _: self._render_action_params())
+
+        self.action_param_frame = ttk.Frame(builder_frame)
+        self.action_param_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.action_param_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(
+            builder_frame,
+            text="Add Step",
+            command=self._on_add_macro_step,
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+
+        run_frame = ttk.Frame(macro_frame)
+        run_frame.grid(row=3, column=0, sticky="ew", pady=6)
+        run_frame.columnconfigure(1, weight=1)
+
+        self.run_macro_button = ttk.Button(run_frame, text="Run Macro", command=self._on_run_macro)
+        self.run_macro_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.stop_macro_button = ttk.Button(
+            run_frame,
+            text="Stop",
+            command=self._on_stop_macro,
+            state=tk.DISABLED,
+        )
+        self.stop_macro_button.grid(row=0, column=1, sticky="ew")
+
+        self.macro_status_label = ttk.Label(
+            macro_frame,
+            textvariable=self.macro_status_var,
+            foreground="#6f4ab2",
+        )
+        self.macro_status_label.grid(row=4, column=0, sticky="w", pady=(0, 6))
+
+        self._render_action_params()
+        self._set_macro_status("Macro idle.")
+
+    def _refresh_windows(self) -> None:
+        windows = self.controller.available_windows()
+        self.window_map = {}
+        display_names: List[str] = []
+        for hwnd, title in windows:
+            label = f"{title}  (0x{hwnd:08X})"
+            display_names.append(label)
+            self.window_map[label] = hwnd
+
+        if self.window_combo:
+            self.window_combo["values"] = display_names
+            if display_names:
+                self.window_combo.current(0)
+        if display_names:
+            self.status_var.set("Select the window and click Lock.")
+        else:
+            self.status_var.set("No visible windows detected.")
+
+    def _on_lock_window(self) -> None:
+        if not self.window_combo:
+            return
+        selection = self.window_combo.get()
+        hwnd = self.window_map.get(selection)
+        if hwnd and self.controller.set_target_window(hwnd):
+            self.status_var.set(f"Locked to {selection}. Press F2 to freeze.")
+            if self.freeze_button:
+                self.freeze_button.configure(state=tk.NORMAL)
+        else:
+            self.status_var.set("Unable to lock to that window.")
+            if self.freeze_button:
+                self.freeze_button.configure(state=tk.DISABLED)
+
+    def _on_toggle_freeze(self) -> None:
+        threading.Thread(target=self._toggle_worker, daemon=True).start()
+
+    def _report_error(self, message: str) -> None:
+        self.status_var.set(message)
+        if self.status_bar and self.status_bar.winfo_exists():
+            self.status_bar.show_warning(message)
+
+    def _set_macro_status(self, message: str, style: str = "info") -> None:
+        self.macro_status_var.set(message)
+        if not hasattr(self, "macro_status_label"):
+            return
+        color_map = {
+            "info": "#6f4ab2",
+            "success": "#1f7a1f",
+            "error": "#8a1c1c",
+        }
+        self.macro_status_label.configure(foreground=color_map.get(style, "#6f4ab2"))
+
+    def _controller_state_callback(self, state: str) -> None:
+        if not self.winfo_exists():
+            return
+        self.after(0, lambda: self._handle_controller_state(state))
+
+    def _handle_controller_state(self, state: str) -> None:
+        if state == "engaged":
+            self._update_ui_for_state(True)
+        elif state == "released":
+            self._update_ui_for_state(False)
+        elif state == "pending":
+            self._show_pending_state()
+        elif state == "cancelled":
+            self._show_cancelled_state()
+        elif state.startswith("error:"):
+            self._report_error(state.split(":", 1)[1].strip() or "Freeze error")
+
+    def _render_action_params(self) -> None:
+        for child in self.action_param_frame.winfo_children():
+            child.destroy()
+        action = self.macro_action_var.get()
+        if action == "Delay":
+            ttk.Label(self.action_param_frame, text="Seconds:").grid(row=0, column=0, sticky="w")
+            self.delay_entry = ttk.Entry(self.action_param_frame, width=10)
+            self.delay_entry.insert(0, "0.500")
+            self.delay_entry.grid(row=0, column=1, sticky="w")
+        elif action == "Send Key":
+            ttk.Label(self.action_param_frame, text="Key:").grid(row=0, column=0, sticky="w")
+            self.key_entry = ttk.Entry(self.action_param_frame, width=10)
+            self.key_entry.insert(0, "Q")
+            self.key_entry.grid(row=0, column=1, sticky="w")
+
+            ttk.Label(self.action_param_frame, text="Hold (s):").grid(row=1, column=0, sticky="w", pady=(4, 0))
+            self.key_hold_entry = ttk.Entry(self.action_param_frame, width=10)
+            self.key_hold_entry.insert(0, "0.050")
+            self.key_hold_entry.grid(row=1, column=1, sticky="w", pady=(4, 0))
+        elif action == "Mouse Click":
+            ttk.Label(self.action_param_frame, text="Button:").grid(row=0, column=0, sticky="w")
+            self.click_button_var = tk.StringVar(value="Left")
+            button_menu = ttk.Combobox(
+                self.action_param_frame,
+                state="readonly",
+                values=("Left", "Right"),
+                textvariable=self.click_button_var,
+                width=10,
+            )
+            button_menu.grid(row=0, column=1, sticky="w")
+
+            ttk.Label(self.action_param_frame, text="Hold (s):").grid(row=1, column=0, sticky="w", pady=(4, 0))
+            self.click_hold_entry = ttk.Entry(self.action_param_frame, width=10)
+            self.click_hold_entry.insert(0, "0.050")
+            self.click_hold_entry.grid(row=1, column=1, sticky="w", pady=(4, 0))
+        else:
+            ttk.Label(
+                self.action_param_frame,
+                text="No parameters required.",
+            ).grid(row=0, column=0, sticky="w")
+
+    def _build_action_from_inputs(self) -> Tuple[Optional[MacroAction], Optional[str]]:
+        action = self.macro_action_var.get()
+        try:
+            if action == "Delay":
+                seconds_text = self.delay_entry.get().strip()
+                seconds = float(seconds_text or "0")
+                if seconds < 0:
+                    return None, "Delay must be non-negative."
+                return DelayAction(seconds=seconds), None
+            if action == "Send Key":
+                key = self.key_entry.get().strip()
+                if not key:
+                    return None, "Enter a key to send."
+                hold_text = self.key_hold_entry.get().strip()
+                hold = float(hold_text or "0")
+                if hold < 0:
+                    return None, "Hold duration must be non-negative."
+                if _get_vk_code(key) is None:
+                    return None, f"Unsupported key: {key}"
+                return KeyPressAction(key=key, hold_seconds=hold), None
+            if action == "Mouse Click":
+                button = (self.click_button_var.get() if hasattr(self, "click_button_var") else "").strip().lower()
+                if button not in MOUSE_BUTTON_EVENTS:
+                    return None, "Select a valid mouse button."
+                hold_text = self.click_hold_entry.get().strip() if hasattr(self, "click_hold_entry") else "0"
+                hold = float(hold_text or "0")
+                if hold < 0:
+                    return None, "Hold duration must be non-negative."
+                return MouseClickAction(button=button, hold_seconds=hold), None
+            if action == "Freeze Engage":
+                return FreezeAction(mode="engage"), None
+            if action == "Freeze Release":
+                return FreezeAction(mode="release"), None
+            if action == "Freeze Toggle":
+                return FreezeAction(mode="toggle"), None
+            return None, "Unknown action type."
+        except ValueError as exc:
+            return None, str(exc)
+
+    def _refresh_macro_list(self) -> None:
+        self.macro_listbox.delete(0, tk.END)
+        for index, action in enumerate(self.macro_steps, start=1):
+            self.macro_listbox.insert(tk.END, f"{index}. {action.describe()}")
+
+    def _on_add_macro_step(self) -> None:
+        action, error = self._build_action_from_inputs()
+        if action is None:
+            self._set_macro_status(error or "Unable to add step.", style="error")
+            return
+        self.macro_steps.append(action)
+        self._refresh_macro_list()
+        self._set_macro_status(f"Added: {action.describe()}")
+
+    def _on_remove_macro_step(self) -> None:
+        if not self.macro_steps:
+            self._set_macro_status("No steps to remove.", style="error")
+            return
+        selection = self.macro_listbox.curselection()
+        index = selection[0] if selection else len(self.macro_steps) - 1
+        removed = self.macro_steps.pop(index)
+        self._refresh_macro_list()
+        self._set_macro_status(f"Removed: {removed.describe()}")
+
+    def _on_move_macro_step(self, direction: int) -> None:
+        if not self.macro_steps:
+            return
+        selection = self.macro_listbox.curselection()
+        if not selection:
+            index = len(self.macro_steps) - 1
+        else:
+            index = selection[0]
+        new_index = index + direction
+        if new_index < 0 or new_index >= len(self.macro_steps):
+            return
+        self.macro_steps[index], self.macro_steps[new_index] = (
+            self.macro_steps[new_index],
+            self.macro_steps[index],
+        )
+        self._refresh_macro_list()
+        self.macro_listbox.selection_clear(0, tk.END)
+        self.macro_listbox.selection_set(new_index)
+        self._set_macro_status("Step order updated.")
+
+    def _on_clear_macro_steps(self) -> None:
+        if not self.macro_steps:
+            return
+        self.macro_steps.clear()
+        self._refresh_macro_list()
+        self._set_macro_status("Macro cleared.", style="info")
+
+    def _on_run_macro(self) -> None:
+        if self.macro_runner.is_running():
+            self._set_macro_status("Macro already running.", style="error")
+            return
+        mode = self.macro_mode.get()
+        success, error = self.macro_runner.start(self.macro_steps, mode)
+        if not success:
+            self._set_macro_status(error or "Failed to start macro.", style="error")
+            return
+        self.run_macro_button.configure(state=tk.DISABLED)
+        self.stop_macro_button.configure(state=tk.NORMAL)
+        self._set_macro_status("Macro running...", style="info")
+
+    def _on_stop_macro(self) -> None:
+        if not self.macro_runner.is_running():
+            self._set_macro_status("Macro is not running.", style="error")
+            return
+        self._set_macro_status("Stopping macro...", style="info")
+        self.macro_runner.stop()
+
+    def _macro_status_callback(self, state: str) -> None:
+        if not self.winfo_exists():
+            return
+        self.after(0, lambda: self._handle_macro_status(state))
+
+    def _handle_macro_status(self, state: str) -> None:
+        if state == "running":
+            self.run_macro_button.configure(state=tk.DISABLED)
+            self.stop_macro_button.configure(state=tk.NORMAL)
+            self._set_macro_status("Macro running...", style="info")
+        elif state == "completed":
+            self.run_macro_button.configure(state=tk.NORMAL)
+            self.stop_macro_button.configure(state=tk.DISABLED)
+            self._set_macro_status("Macro completed.", style="success")
+        elif state == "stopped":
+            self.run_macro_button.configure(state=tk.NORMAL)
+            self.stop_macro_button.configure(state=tk.DISABLED)
+            self._set_macro_status("Macro stopped.", style="info")
+        elif state.startswith("error:"):
+            self.run_macro_button.configure(state=tk.NORMAL)
+            self.stop_macro_button.configure(state=tk.DISABLED)
+            self._set_macro_status(state.split(":", 1)[1].strip(), style="error")
+
+    def _toggle_worker(self) -> None:
+        try:
+            result = self.controller.toggle_freeze()
+        except RuntimeError as err:
+            self.after(0, lambda: self._report_error(str(err)))
+        else:
+            if result == "pending":
+                self.after(0, self._show_pending_state)
+            elif result == "cancelled":
+                self.after(0, self._show_cancelled_state)
+
+    def _update_ui_for_state(self, frozen: bool) -> None:
+        if not self.freeze_button:
+            return
+        if frozen:
+            self.freeze_button.configure(text="Release Freeze")
+            self.status_var.set("Freeze engaged. Move the mouse freely.")
+        else:
+            self.freeze_button.configure(text="Engage Freeze")
+            self.status_var.set("Freeze released.")
+        if self.status_bar and self.status_bar.winfo_exists():
+            self.status_bar.update_state(frozen)
+
+    def _show_pending_state(self) -> None:
+        self.status_var.set("Waiting for right click release to engage freeze...")
+        if self.freeze_button:
+            self.freeze_button.configure(text="Cancel Pending", state=tk.NORMAL)
+        if self.status_bar and self.status_bar.winfo_exists():
+            self.status_bar.show_pending("Release right click for freeze")
+
+    def _show_cancelled_state(self) -> None:
+        if self.freeze_button:
+            self.freeze_button.configure(text="Engage Freeze", state=tk.NORMAL)
+        self.status_var.set("Freeze pending cancelled.")
+        if self.status_bar and self.status_bar.winfo_exists():
+            self.status_bar.update_state(False)
+
+    def _handle_freeze_hotkey(self) -> None:
+        threading.Thread(target=self._toggle_worker, daemon=True).start()
+
+    def _handle_macro_hotkey(self) -> None:
+        self.after(0, self._toggle_macro_via_hotkey)
+
+    def _toggle_macro_via_hotkey(self) -> None:
+        if self.macro_runner.is_running():
+            self._on_stop_macro()
+        else:
+            self._on_run_macro()
+
+    def _on_close(self) -> None:
+        self.controller.set_state_callback(None)
+        self.freeze_hotkey_listener.stop()
+        self.macro_hotkey_listener.stop()
+        self.controller.cancel_pending()
+        self.controller.release_freeze()
+        if self.status_bar and self.status_bar.winfo_exists():
+            self.status_bar.destroy()
+        self.destroy()
+
+
+def main() -> None:
+    controller = FreezeController()
+    app = FreezeUI(controller)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
